@@ -1,0 +1,983 @@
+from __future__ import annotations
+
+import json
+import html
+from io import BytesIO
+import os
+import re
+import time
+from collections import Counter
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+import zipfile
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from dotenv import load_dotenv
+
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env", override=False)
+RESULTS_DIR = BASE_DIR / "github-real-results"
+REQUIRED_FILES = {
+    "summary": RESULTS_DIR / "summary.json",
+    "event_types": RESULTS_DIR / "event_types.csv",
+    "repositories": RESULTS_DIR / "repositories.csv",
+    "developers": RESULTS_DIR / "developers.csv",
+    "daily_activity": RESULTS_DIR / "daily_activity.csv",
+    "activity_heatmap": RESULTS_DIR / "activity_heatmap.csv",
+    "insights": RESULTS_DIR / "insights.txt",
+}
+CSV_COLUMNS = {
+    "event_types": {"event_type", "count"},
+    "repositories": {"repository", "count"},
+    "developers": {"developer", "count"},
+    "daily_activity": {"date", "count"},
+    "activity_heatmap": {"date", "hour", "count"},
+}
+COLORS = {
+    "background": "#0d1117",
+    "card": "#161b22",
+    "border": "#30363d",
+    "text": "#f0f6fc",
+    "muted": "#8b949e",
+    "green": "#2da44e",
+    "blue": "#58a6ff",
+    "orange": "#d29922",
+    "red": "#f85149",
+}
+PLOTLY_CONFIG = {"displaylogo": False, "responsive": True}
+DATASET_ID = "current"
+GITHUB_EVENTS_URL = "https://api.github.com/events?per_page=100&page=1"
+LIVE_EVENT_LIMIT = 1000
+
+
+st.set_page_config(
+    page_title="GitHub Public Activity Analytics",
+    page_icon="◉",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+def apply_theme() -> None:
+    """Apply the dashboard's GitHub-inspired visual theme."""
+    st.markdown(
+        f"""
+        <style>
+        :root {{ color-scheme: dark; }}
+        .stApp {{ background: {COLORS['background']}; color: {COLORS['text']}; }}
+        [data-testid="stSidebar"] {{ background: #010409; border-right: 1px solid {COLORS['border']}; }}
+        [data-testid="stHeader"] {{ background: rgba(13, 17, 23, 0.88); }}
+        [data-testid="stMetric"] {{ background: {COLORS['card']}; border: 1px solid {COLORS['border']};
+            padding: 1rem 1.1rem; border-radius: 12px; min-height: 112px; }}
+        [data-testid="stMetricLabel"] p {{ color: {COLORS['muted']}; font-size: .86rem; }}
+        [data-testid="stMetricValue"] {{ color: {COLORS['text']}; font-size: clamp(1.25rem, 2vw, 1.85rem); }}
+        div[data-testid="stVerticalBlockBorderWrapper"] {{ border-radius: 12px; }}
+        .hero {{ padding: 1.25rem 0 .7rem; }}
+        .hero h1 {{ margin: 0 0 .35rem; letter-spacing: -.035em; font-size: clamp(1.8rem, 4vw, 2.55rem); }}
+        .hero p {{ color: {COLORS['muted']}; font-size: 1.05rem; margin: 0; }}
+        .eyebrow {{ color: {COLORS['green']}; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; font-size: .76rem; }}
+        .status-chip {{ display:inline-block; padding:.35rem .65rem; border:1px solid {COLORS['border']};
+            border-radius:999px; background:{COLORS['card']}; color:{COLORS['text']}; font-size:.84rem; }}
+        .muted {{ color:{COLORS['muted']}; }}
+        .insight-card {{ background:{COLORS['card']}; border:1px solid {COLORS['border']}; border-radius:12px;
+            padding:1rem 1.1rem; margin:.45rem 0; line-height:1.55; }}
+        .section-title {{ padding-top:.5rem; }}
+        a {{ color:{COLORS['blue']} !important; }}
+        @media (max-width: 700px) {{ .block-container {{ padding-left:1rem; padding-right:1rem; }} }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def load_csv(path_text: str, modified_ns: int) -> pd.DataFrame:
+    """Load and validate a result CSV, retaining the source's values."""
+    del modified_ns  # Included in the cache key so refreshed files are re-read.
+    path = Path(path_text)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing required file: {path}")
+    try:
+        frame = pd.read_csv(path)
+    except pd.errors.EmptyDataError as exc:
+        raise ValueError(f"{path.name} is empty and has no column header.") from exc
+    except (OSError, UnicodeError, pd.errors.ParserError) as exc:
+        raise ValueError(f"Could not read {path.name}: {exc}") from exc
+    if frame.empty and len(frame.columns) == 0:
+        raise ValueError(f"{path.name} is empty and has no column header.")
+    return frame
+
+
+@st.cache_data(show_spinner=False)
+def load_summary(path_text: str, modified_ns: int) -> dict[str, Any]:
+    del modified_ns
+    path = Path(path_text)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing required file: {path}")
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read {path.name}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{path.name} must contain a JSON object.")
+    return data
+
+
+@st.cache_data(show_spinner=False)
+def load_insights(path_text: str, modified_ns: int) -> str:
+    del modified_ns
+    path = Path(path_text)
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing required file: {path}")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Could not read {path.name}: {exc}") from exc
+
+
+def file_version(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def load_file_results() -> tuple[dict[str, Any], dict[str, pd.DataFrame], str, list[str]]:
+    """Load all required result files and return actionable validation errors."""
+    errors: list[str] = []
+    summary: dict[str, Any] = {}
+    frames: dict[str, pd.DataFrame] = {}
+    insights = ""
+    for key, path in REQUIRED_FILES.items():
+        if not path.is_file():
+            errors.append(f"Missing required file: `{path}`. Restore it from the PySpark results output.")
+    if errors:
+        return summary, frames, insights, errors
+
+    try:
+        summary = load_summary(str(REQUIRED_FILES["summary"]), file_version(REQUIRED_FILES["summary"]))
+    except (ValueError, FileNotFoundError) as exc:
+        errors.append(str(exc))
+    try:
+        insights = load_insights(str(REQUIRED_FILES["insights"]), file_version(REQUIRED_FILES["insights"]))
+    except (ValueError, FileNotFoundError) as exc:
+        errors.append(str(exc))
+    for key in CSV_COLUMNS:
+        path = REQUIRED_FILES[key]
+        try:
+            frame = load_csv(str(path), file_version(path))
+            missing = CSV_COLUMNS[key] - set(frame.columns)
+            if missing:
+                errors.append(
+                    f"Invalid `{path.name}`: missing columns {', '.join(sorted(missing))}. "
+                    "Regenerate the result files with the project notebook."
+                )
+            else:
+                frames[key] = frame
+        except (ValueError, FileNotFoundError) as exc:
+            errors.append(str(exc))
+    return summary, frames, insights, errors
+
+
+def cassandra_config() -> dict[str, Any]:
+    """Read optional Cassandra settings from environment or Streamlit secrets."""
+    try:
+        secrets = st.secrets.get("cassandra", {})
+    except Exception:
+        secrets = {}
+
+    def setting(env_name: str, secret_name: str, default: Any = None) -> Any:
+        return os.getenv(env_name) or secrets.get(secret_name, default)
+
+    contact_points = setting("CASSANDRA_CONTACT_POINTS", "contact_points", "")
+    if isinstance(contact_points, str):
+        contact_points = [host.strip() for host in contact_points.split(",") if host.strip()]
+    elif not contact_points:
+        contact_points = []
+    try:
+        port = int(setting("CASSANDRA_PORT", "port", 9042))
+    except (TypeError, ValueError):
+        port = None
+    return {
+        "contact_points": contact_points,
+        "port": port,
+        "keyspace": setting("CASSANDRA_KEYSPACE", "keyspace", "github_analytics"),
+        "username": setting("CASSANDRA_USERNAME", "username"),
+        "password": setting("CASSANDRA_PASSWORD", "password"),
+        "secure_connect_bundle": setting("CASSANDRA_SECURE_CONNECT_BUNDLE", "secure_connect_bundle"),
+    }
+
+
+@st.cache_resource(show_spinner=False)
+def cassandra_session(
+    contact_points: tuple[str, ...],
+    port: int,
+    keyspace: str,
+    username: str | None,
+    password: str | None,
+    secure_connect_bundle: str | None,
+) -> Any:
+    """Create one reusable Cassandra session for the Streamlit process."""
+    from cassandra.auth import PlainTextAuthProvider
+    from cassandra.cluster import Cluster
+
+    auth_provider = PlainTextAuthProvider(username=username, password=password) if username and password else None
+    if secure_connect_bundle:
+        cluster = Cluster(
+            cloud={"secure_connect_bundle": secure_connect_bundle},
+            auth_provider=auth_provider,
+        )
+    else:
+        cluster = Cluster(
+            list(contact_points),
+            port=port,
+            auth_provider=auth_provider,
+        )
+    return cluster.connect(keyspace)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_cassandra_results(
+    contact_points: tuple[str, ...],
+    port: int,
+    keyspace: str,
+    username: str | None,
+    password: str | None,
+    secure_connect_bundle: str | None,
+) -> tuple[dict[str, Any], dict[str, pd.DataFrame], str]:
+    """Read the dashboard's query-oriented aggregate tables from Cassandra."""
+    try:
+        session = cassandra_session(contact_points, port, keyspace, username, password, secure_connect_bundle)
+    except Exception as exc:
+        raise ValueError(
+            f"Could not connect to Cassandra keyspace `{keyspace}`. Check the contact points, port, "
+            f"credentials, and that the Cassandra service is running: {exc}"
+        ) from exc
+    try:
+        events = session.execute(
+            "SELECT event_type, event_count FROM event_types WHERE dataset_id = %s", (DATASET_ID,)
+        )
+        repositories = session.execute(
+            "SELECT repository, event_count FROM repositories WHERE dataset_id = %s", (DATASET_ID,)
+        )
+        developers = session.execute(
+            "SELECT developer, event_count FROM developers WHERE dataset_id = %s", (DATASET_ID,)
+        )
+        daily = session.execute(
+            "SELECT activity_date, event_count FROM daily_activity WHERE dataset_id = %s", (DATASET_ID,)
+        )
+        heatmap = session.execute(
+            "SELECT activity_date, hour, event_count FROM activity_heatmap WHERE dataset_id = %s", (DATASET_ID,)
+        )
+        summary_row = session.execute(
+            "SELECT payload FROM summary WHERE dataset_id = %s", (DATASET_ID,)
+        ).one()
+        insights_row = session.execute(
+            "SELECT content FROM insights WHERE dataset_id = %s", (DATASET_ID,)
+        ).one()
+    except Exception as exc:
+        raise ValueError(
+            f"Could not query keyspace `{keyspace}`. Confirm the tables from `cassandra_schema.cql` "
+            f"exist and run `python load_results_to_cassandra.py`. Cassandra reported: {exc}"
+        ) from exc
+
+    if summary_row is None or insights_row is None:
+        raise ValueError(
+            "Cassandra is reachable, but the `current` summary or insights row is missing. "
+            "Run `python load_results_to_cassandra.py` after applying the schema."
+        )
+    try:
+        summary = json.loads(summary_row.payload)
+        if not isinstance(summary, dict):
+            raise ValueError("summary payload must be a JSON object")
+    except (TypeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"Invalid JSON in Cassandra summary.payload: {exc}") from exc
+
+    def count_frame(rows: Any, label: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [{label: getattr(row, label), "count": getattr(row, "event_count")} for row in rows],
+            columns=[label, "count"],
+        )
+
+    frames = {
+        "event_types": count_frame(events, "event_type"),
+        "repositories": count_frame(repositories, "repository"),
+        "developers": count_frame(developers, "developer"),
+        "daily_activity": pd.DataFrame(
+            [{"date": row.activity_date, "count": row.event_count} for row in daily],
+            columns=["date", "count"],
+        ),
+        "activity_heatmap": pd.DataFrame(
+            [{"date": row.activity_date, "hour": row.hour, "count": row.event_count} for row in heatmap],
+            columns=["date", "hour", "count"],
+        ),
+    }
+    empty_tables = [name for name, frame in frames.items() if frame.empty]
+    if empty_tables:
+        raise ValueError(
+            f"Cassandra returned no rows for {', '.join(empty_tables)}. "
+            "Run `python load_results_to_cassandra.py` after applying the schema."
+        )
+    for frame in frames.values():
+        if "date" in frame.columns:
+            frame["date"] = frame["date"].astype(str)
+    return summary, frames, insights_row.content or ""
+
+
+def format_event_name(value: Any) -> str:
+    """Make event type identifiers readable while preserving raw labels in tooltips."""
+    raw = str(value)
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", raw).strip()
+    return spaced or raw
+
+
+def format_number(value: Any) -> str:
+    try:
+        number = float(value)
+        if not pd.notna(number):
+            return "Not provided"
+        if number.is_integer():
+            return f"{int(number):,}"
+        return f"{number:,.2f}"
+    except (TypeError, ValueError):
+        return "Not provided"
+
+
+def numeric_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    return pd.to_numeric(frame[column], errors="coerce").fillna(0).clip(lower=0)
+
+
+def normalize_counts(frame: pd.DataFrame, label_column: str) -> pd.DataFrame:
+    result = frame[[label_column, "count"]].copy()
+    result[label_column] = result[label_column].fillna("Unknown").astype(str)
+    result["count"] = numeric_column(result, "count")
+    return result.sort_values("count", ascending=False, kind="stable")
+
+
+def chart_layout(fig: go.Figure, *, height: int = 360) -> go.Figure:
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=COLORS["card"],
+        plot_bgcolor=COLORS["card"],
+        font={"color": COLORS["text"], "family": "Inter, Segoe UI, sans-serif"},
+        margin={"l": 16, "r": 16, "t": 26, "b": 20},
+        height=height,
+        legend={"orientation": "h", "y": 1.08, "x": 0},
+    )
+    fig.update_xaxes(gridcolor=COLORS["border"], zerolinecolor=COLORS["border"])
+    fig.update_yaxes(gridcolor=COLORS["border"], zerolinecolor=COLORS["border"])
+    return fig
+
+
+def event_figures(events: pd.DataFrame) -> tuple[go.Figure, go.Figure]:
+    data = normalize_counts(events, "event_type")
+    data["display_name"] = data["event_type"].map(format_event_name)
+    bars = px.bar(
+        data.sort_values("count", ascending=True),
+        x="count",
+        y="display_name",
+        orientation="h",
+        custom_data=["event_type"],
+        labels={"count": "Events in sample", "display_name": "Event type", "event_type": "Original event type"},
+        color_discrete_sequence=[COLORS["green"]],
+    )
+    bars.update_traces(hovertemplate="%{customdata[0]}<br>Events: %{x:,}<extra></extra>")
+    bars = chart_layout(bars, height=max(350, min(620, 24 * len(data) + 100)))
+    bars.update_layout(showlegend=False)
+    donut = px.pie(
+        data,
+        names="display_name",
+        values="count",
+        hole=0.58,
+        custom_data=["event_type"],
+        color_discrete_sequence=px.colors.qualitative.Safe,
+    )
+    donut.update_traces(
+        textinfo="percent",
+        hovertemplate="%{customdata[0]}<br>Events: %{value:,}<br>Share: %{percent}<extra></extra>",
+    )
+    donut = chart_layout(donut, height=390)
+    return bars, donut
+
+
+def ranked_figure(data: pd.DataFrame, label_column: str, color: str) -> go.Figure:
+    data = data.sort_values("count", ascending=True, kind="stable")
+    fig = px.bar(
+        data,
+        x="count",
+        y=label_column,
+        orientation="h",
+        labels={"count": "Events in sample", label_column: ""},
+        color_discrete_sequence=[color],
+        hover_data={label_column: True, "count": ":,", "is_bot": False} if "is_bot" in data else {label_column: True, "count": ":,"},
+    )
+    fig.update_traces(hovertemplate="%{y}<br>Events: %{x:,}<extra></extra>")
+    fig.update_yaxes(automargin=True, tickfont={"size": 11})
+    fig.update_layout(showlegend=False)
+    return chart_layout(fig, height=max(340, min(580, 31 * len(data) + 85)))
+
+
+def split_insights(text: str) -> dict[str, list[str]]:
+    sections = {"Main findings": [], "Recommendations": [], "Limitations": []}
+    active = "Main findings"
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower = line.lower().rstrip(":")
+        if lower in {"limitations", "recommendations", "main findings", "findings"}:
+            active = "Main findings" if lower == "findings" else lower.title()
+            continue
+        line = re.sub(r"^[•\-*]\s*", "", line)
+        if line.upper() == "ACTUAL PUBLIC GITHUB EVENTS (COLLECTED SAMPLE)":
+            continue
+        if line.lower().startswith("recommendation:"):
+            sections["Recommendations"].append(line.split(":", 1)[1].strip())
+        elif line.lower().startswith("limitations:"):
+            sections["Limitations"].append(line.split(":", 1)[1].strip())
+        else:
+            sections.setdefault(active, []).append(line)
+    return sections
+
+
+def build_powerbi_package(
+    summary: dict[str, Any], frames: dict[str, pd.DataFrame], insight_text: str
+) -> bytes:
+    """Bundle the currently selected source data for Power BI Desktop."""
+    instructions = """GitHub Public Activity Analytics — Power BI import package
+
+Contents
+--------
+event_types.csv, repositories.csv, developers.csv, daily_activity.csv,
+activity_heatmap.csv, summary.json, and insights.txt are exported from the
+currently selected dashboard data source. No data is synthesized or changed.
+
+Import into Power BI Desktop
+----------------------------
+1. Extract this ZIP file to a folder.
+2. In Power BI Desktop, choose Home > Get data > Text/CSV.
+3. Import each CSV as a separate table. Import summary.json separately if
+   you want its metadata in the model.
+4. Choose Close & Apply, then save the report as a .pbix file.
+
+Notes
+-----
+The source files are aggregates. Event-type filtering is only available in
+that table; cross-filtering across event type, repository, and developer is
+not possible from these source aggregates. Heatmap zeros represent no row in
+this collected sample and do not mean no global GitHub activity occurred.
+"""
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for key in ("event_types", "repositories", "developers", "daily_activity", "activity_heatmap"):
+            archive.writestr(f"{key}.csv", frames[key].to_csv(index=False).encode("utf-8"))
+        archive.writestr("summary.json", json.dumps(summary, indent=2, ensure_ascii=False).encode("utf-8"))
+        archive.writestr("insights.txt", insight_text.encode("utf-8"))
+        archive.writestr("POWER_BI_IMPORT.txt", instructions)
+    return buffer.getvalue()
+
+
+def show_insight_group(title: str, items: list[str], icon: str) -> None:
+    with st.container(border=True):
+        st.markdown(f"#### {icon} {title}")
+        if items:
+            for item in items:
+                safe_item = html.escape(item)
+                st.markdown(f'<div class="insight-card">{safe_item}</div>', unsafe_allow_html=True)
+        else:
+            st.caption("No entries provided in insights.txt.")
+
+
+def fetch_live_public_events(etag: str | None) -> tuple[list[dict[str, Any]], str | None, int, bool]:
+    """Fetch the latest public GitHub events, using ETags to avoid repeat payloads."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "GitHub-Public-Activity-Analytics",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if etag:
+        headers["If-None-Match"] = etag
+
+    request = Request(GITHUB_EVENTS_URL, headers=headers)
+    try:
+        with urlopen(request, timeout=20) as response:
+            records = json.load(response)
+            if not isinstance(records, list):
+                raise RuntimeError("GitHub returned an unexpected response; expected a list of events.")
+            interval = int(response.headers.get("X-Poll-Interval", "60"))
+            return records, response.headers.get("ETag") or etag, max(60, interval), False
+    except HTTPError as exc:
+        interval = max(60, int(exc.headers.get("X-Poll-Interval", "60")))
+        if exc.code == 304:
+            return [], etag, interval, True
+        if exc.code in (403, 429):
+            reset_at = exc.headers.get("X-RateLimit-Reset")
+            detail = f" Rate limit reset (Unix time): {reset_at}." if reset_at else ""
+            raise RuntimeError(f"GitHub rate limited this session.{detail} Wait before polling again or configure GITHUB_TOKEN.") from None
+        raise RuntimeError(f"GitHub Events API returned HTTP {exc.code}.") from None
+    except URLError as exc:
+        reason = getattr(exc, "reason", "network error")
+        raise RuntimeError(f"Could not reach GitHub: {reason}") from None
+
+
+def describe_live_event(event: dict[str, Any]) -> dict[str, str]:
+    """Select safe, readable fields from one public event payload."""
+    event_type = str(event.get("type") or "UnknownEvent")
+    payload = event.get("payload") or {}
+    repository = (event.get("repo") or {}).get("name") or "Unknown repository"
+    actor = (event.get("actor") or {}).get("login") or "Unknown actor"
+    created_at = str(event.get("created_at") or "")
+    detail = str(payload.get("action") or "")
+
+    if event_type == "PushEvent":
+        ref = payload.get("ref")
+        if ref:
+            detail = f"{detail + ' · ' if detail else ''}{ref}"
+    elif event_type in {"PullRequestEvent", "IssuesEvent", "IssueCommentEvent", "PullRequestReviewEvent", "PullRequestReviewCommentEvent"}:
+        item = payload.get("pull_request") or payload.get("issue") or {}
+        number = item.get("number")
+        title = item.get("title")
+        parts = [part for part in (f"#{number}" if number else "", title or "") if part]
+        if parts:
+            detail = f"{detail + ' · ' if detail else ''}{' — '.join(parts)}"
+
+    try:
+        parsed = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        created_at = parsed.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except ValueError:
+        pass
+    return {
+        "id": str(event.get("id") or ""),
+        "time": created_at,
+        "event_type": event_type,
+        "repository": str(repository),
+        "actor": str(actor),
+        "detail": detail or "—",
+    }
+
+
+def render_live_dashboard() -> None:
+    """Poll and display the latest public events for this Streamlit session."""
+    st.markdown(
+        '<div class="hero"><div class="eyebrow">Live view · GitHub public events</div>'
+        '<h1>Live GitHub Activity</h1>'
+        '<p>Recent push, pull request, issue, and other public events from GitHub.</p></div>',
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "GitHub's public Events API is delayed and rate limited. This view refreshes at the allowed polling interval; "
+        "it is near real time, not a complete or instantaneous feed. Events are kept only in this browser session."
+    )
+
+    st.session_state.setdefault("live_event_log", {})
+    st.session_state.setdefault("live_etag", None)
+    st.session_state.setdefault("live_next_poll", 0.0)
+    st.session_state.setdefault("live_last_checked", None)
+    st.session_state.setdefault("live_error", None)
+    st.session_state.setdefault("live_new_event_count", 0)
+    st.session_state.setdefault("live_initialized", False)
+
+    with st.sidebar:
+        st.markdown("### Live feed settings")
+        auto_update = st.checkbox("Auto refresh", value=True, key="live_auto_update")
+        refresh_seconds = st.select_slider(
+            "Refresh interval",
+            options=[60, 75, 90, 120, 180, 300],
+            value=60,
+            format_func=lambda value: f"{value} seconds",
+            key="live_refresh_seconds",
+        )
+        st.caption("The API may require a longer interval; the app follows its X-Poll-Interval header.")
+        if st.button("Clear this session's live events", key="clear_live_events"):
+            st.session_state.live_event_log = {}
+            st.session_state.live_new_event_count = 0
+            st.session_state.live_etag = None
+            st.session_state.live_next_poll = 0.0
+            st.session_state.live_error = None
+            st.session_state.live_initialized = False
+            st.rerun()
+
+    def update_and_display() -> None:
+        manual_poll = st.button("Poll now", key="poll_live_now")
+        now = time.time()
+        if manual_poll and now < st.session_state.live_next_poll:
+            wait = max(1, int(st.session_state.live_next_poll - now))
+            st.warning(f"GitHub's polling interval has not elapsed. Try again in about {wait} seconds.")
+        elif now >= st.session_state.live_next_poll:
+            try:
+                records, etag, server_interval, not_modified = fetch_live_public_events(st.session_state.live_etag)
+                st.session_state.live_etag = etag
+                if not not_modified:
+                    log = st.session_state.live_event_log
+                    added = 0
+                    for raw in records:
+                        row = describe_live_event(raw)
+                        if st.session_state.live_initialized and row["id"] and row["id"] not in log:
+                            added += 1
+                        if row["id"]:
+                            log[row["id"]] = row
+                    st.session_state.live_initialized = True
+                    ordered = sorted(log.values(), key=lambda row: row["time"], reverse=True)
+                    st.session_state.live_event_log = {row["id"]: row for row in ordered[:LIVE_EVENT_LIMIT]}
+                    st.session_state.live_new_event_count += added
+                    st.session_state.live_error = None
+                st.session_state.live_next_poll = time.time() + max(refresh_seconds, server_interval)
+                st.session_state.live_last_checked = datetime.now().astimezone().strftime("%b %d, %Y · %H:%M:%S %Z")
+            except (RuntimeError, ValueError) as exc:
+                st.session_state.live_error = str(exc)
+                st.session_state.live_next_poll = time.time() + refresh_seconds
+                st.session_state.live_last_checked = datetime.now().astimezone().strftime("%b %d, %Y · %H:%M:%S %Z")
+
+        last_checked = st.session_state.live_last_checked or "Waiting for first poll"
+        st.caption(f"Last checked: {last_checked} · Next allowed poll follows the GitHub response header.")
+        if st.session_state.live_error:
+            st.error(st.session_state.live_error)
+
+        log = list(st.session_state.live_event_log.values())
+        total = len(log)
+        event_counts = Counter(row["event_type"] for row in log)
+        repo_count = len({row["repository"] for row in log})
+        cols = st.columns(4)
+        cols[0].metric("Unique events observed", format_number(total))
+        cols[1].metric("New since initial poll", format_number(st.session_state.live_new_event_count))
+        cols[2].metric("Repositories", format_number(repo_count))
+        cols[3].metric("Event types", format_number(len(event_counts)))
+
+        if not log:
+            st.warning("No events are available yet. Wait for the first GitHub API response or try again later.")
+            return
+
+        chart_col, filter_col = st.columns([1.2, 0.8])
+        with chart_col:
+            counts = pd.DataFrame(event_counts.most_common(), columns=["event_type", "count"])
+            counts["label"] = counts["event_type"].map(format_event_name)
+            chart = px.bar(counts.sort_values("count"), x="count", y="label", orientation="h",
+                           labels={"count": "Events observed in this session", "label": "Event type"},
+                           color_discrete_sequence=[COLORS["green"]])
+            st.plotly_chart(chart_layout(chart, height=max(300, min(600, 28 * len(counts) + 100))),
+                            width="stretch", config=PLOTLY_CONFIG)
+        with filter_col:
+            st.markdown("### Activity by type")
+            for event_type, count in event_counts.most_common(8):
+                st.markdown(f"**{format_event_name(event_type)}** · {count:,}")
+
+        event_options = ["All event types"] + sorted(event_counts)
+        selected = st.selectbox("Filter recent events", event_options, key="live_event_type_filter")
+        filtered = log if selected == "All event types" else [row for row in log if row["event_type"] == selected]
+        display = pd.DataFrame(filtered[:100])
+        if not display.empty:
+            display = display.rename(columns={
+                "time": "Time (UTC)", "event_type": "Event type", "repository": "Repository",
+                "actor": "Actor", "detail": "Details", "id": "Event ID",
+            })
+            st.dataframe(display[["Time (UTC)", "Event type", "Repository", "Actor", "Details", "Event ID"]],
+                         width="stretch", hide_index=True)
+            st.caption(f"Showing up to 100 of {len(filtered):,} matching events observed in this session.")
+
+    fragment = st.fragment(run_every=refresh_seconds if auto_update else None)
+    fragment(update_and_display)()
+
+
+def main() -> None:
+    apply_theme()
+    config = cassandra_config()
+    has_cassandra_config = bool(config["contact_points"] or config["secure_connect_bundle"])
+    with st.sidebar:
+        st.markdown("## ◉ GitHub Analytics")
+        st.caption("Public activity · PySpark results")
+        source_mode = st.radio(
+            "Data source",
+            ["Automatic", "Cassandra", "Local result files", "Live public events"],
+            help="Live public events polls GitHub's Events API. Automatic uses Cassandra when configured, otherwise local result files.",
+        )
+        st.markdown("### Navigate")
+        st.markdown(
+            "[Overview](#overview) · [Events](#event-type-analysis) · "
+            "[Repositories](#repository-analysis) · [Developers](#developer-analysis) · "
+            "[Daily activity](#daily-activity) · [Data quality](#data-quality-and-methodology)"
+        )
+        if st.button("↻ Refresh data", width="stretch"):
+            st.cache_data.clear()
+            st.rerun()
+        st.markdown("### Dataset notes")
+        st.caption(
+            "Aggregated sample data. Date and event filters cannot be applied across repository, "
+            "developer, or heatmap results because those source files do not retain those dimensions."
+        )
+        st.caption("Zero heatmap cells indicate no matching record in this dataset sample.")
+
+    if source_mode == "Live public events":
+        render_live_dashboard()
+        return
+
+    using_cassandra = source_mode == "Cassandra" or (source_mode == "Automatic" and has_cassandra_config)
+    errors: list[str] = []
+    if using_cassandra:
+        if not has_cassandra_config:
+            errors.append(
+                "Cassandra was selected, but no connection is configured. Set `CASSANDRA_CONTACT_POINTS` "
+                "and `CASSANDRA_KEYSPACE`, or add them under `[cassandra]` in Streamlit secrets."
+            )
+        elif not config["secure_connect_bundle"] and not config["contact_points"]:
+            errors.append("Set `CASSANDRA_CONTACT_POINTS` unless you are connecting with a secure-connect bundle.")
+        elif config["port"] is None or not 1 <= config["port"] <= 65535:
+            errors.append("`CASSANDRA_PORT` must be an integer from 1 through 65535.")
+        elif bool(config["username"]) != bool(config["password"]):
+            errors.append("Set both `CASSANDRA_USERNAME` and `CASSANDRA_PASSWORD`, or leave both unset.")
+        else:
+            try:
+                summary, frames, insight_text = load_cassandra_results(
+                    tuple(config["contact_points"]),
+                    config["port"],
+                    config["keyspace"],
+                    config["username"],
+                    config["password"],
+                    config["secure_connect_bundle"],
+                )
+            except Exception as exc:
+                summary, frames, insight_text = {}, {}, ""
+                errors.append(f"Cassandra data could not be loaded: {exc}")
+        source_label = "Cassandra"
+    else:
+        summary, frames, insight_text, errors = load_file_results()
+        source_label = "Local result files"
+
+    start = summary.get("start_utc", "Not provided")
+    end = summary.get("end_utc", "Not provided")
+    with st.sidebar:
+        st.markdown("### Data window")
+        st.caption(f"Source: {source_label}")
+        st.caption(f"UTC: {start} → {end}")
+
+    if errors:
+        st.error("The selected dashboard data source needs attention. Fix the listed issue and select **Refresh data**.")
+        for error in errors:
+            st.markdown(f"- {error}")
+        return
+
+    events = normalize_counts(frames["event_types"], "event_type")
+    repositories = normalize_counts(frames["repositories"], "repository")
+    developers = normalize_counts(frames["developers"], "developer")
+
+    st.markdown('<div id="overview"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="hero"><div class="eyebrow">◉ Public data · PySpark analysis</div>'
+        '<h1>GitHub Public Activity Analytics</h1>'
+        '<p>Interactive analysis of actual public GitHub events using PySpark</p></div>',
+        unsafe_allow_html=True,
+    )
+    latest_mtime = max((file_version(path) for path in REQUIRED_FILES.values()), default=0)
+    refreshed = (
+        f"Cassandra · queried {datetime.now().astimezone().strftime('%H:%M %Z')}"
+        if using_cassandra
+        else (
+            datetime.fromtimestamp(latest_mtime / 1_000_000_000)
+            .astimezone()
+            .strftime("%b %d, %Y · %H:%M %Z")
+            if latest_mtime
+            else "Unavailable"
+        )
+    )
+    status_cols = st.columns([1.15, 1, 1.4])
+    status_cols[0].markdown('<span class="status-chip">● Actual public GitHub events</span>', unsafe_allow_html=True)
+    status_cols[1].markdown(f'<span class="status-chip">◷ {start} – {end} UTC</span>', unsafe_allow_html=True)
+    status_cols[2].markdown(f'<span class="status-chip">↻ Results updated {refreshed}</span>', unsafe_allow_html=True)
+
+    st.markdown("### At a glance")
+    total_events = summary.get("unique_events", events["count"].sum())
+    unique_repos = summary.get("unique_repositories", len(repositories))
+    unique_devs = summary.get("unique_developers", len(developers))
+    synthetic = summary.get("synthetic_events", 0)
+    most_common = events.iloc[0] if not events.empty else None
+    most_repo = repositories.iloc[0] if not repositories.empty else None
+    kpis = st.columns(3)
+    kpis[0].metric("📦 Total Events", format_number(total_events))
+    kpis[1].metric("🗂️ Unique Repositories", format_number(unique_repos))
+    kpis[2].metric("👥 Unique Developers", format_number(unique_devs))
+    kpis = st.columns(3)
+    kpis[0].metric("🧪 Synthetic Events", format_number(synthetic))
+    kpis[1].metric(
+        "⚡ Most Common Event Type",
+        format_event_name(most_common["event_type"]) if most_common is not None else "Not available",
+        help="Derived from the event-type aggregate table in the selected data source.",
+    )
+    kpis[2].metric(
+        "📌 Most Active Repository",
+        str(most_repo["repository"]) if most_repo is not None else "Not available",
+        help="Most frequent repository in repositories.csv.",
+    )
+
+    st.markdown('<div id="event-type-analysis"></div>', unsafe_allow_html=True)
+    st.markdown("## Event type analysis")
+    event_options = ["All event types"] + events["event_type"].astype(str).tolist()
+    selected_event = st.selectbox("Event type filter", event_options, key="event_filter")
+    event_view = events if selected_event == "All event types" else events[events["event_type"] == selected_event]
+    bars, donut = event_figures(event_view)
+    left, right = st.columns([1.15, 0.85])
+    with left:
+        st.plotly_chart(bars, width="stretch", config=PLOTLY_CONFIG)
+    with right:
+        st.plotly_chart(donut, width="stretch", config=PLOTLY_CONFIG)
+
+    top_n = st.sidebar.selectbox("Top repositories and developers", [5, 10, 15, 20], index=1)
+    st.markdown('<div id="repository-analysis"></div>', unsafe_allow_html=True)
+    st.markdown("## Repository analysis")
+    repo_view = repositories.head(top_n).copy()
+    left, right = st.columns([1.1, 0.9])
+    with left:
+        st.plotly_chart(ranked_figure(repo_view, "repository", COLORS["blue"]), width="stretch", config=PLOTLY_CONFIG)
+    with right:
+        st.dataframe(repo_view.rename(columns={"repository": "Repository", "count": "Events"}), width="stretch", hide_index=True)
+        st.download_button(
+            "⬇ Download displayed repositories",
+            repo_view.to_csv(index=False).encode("utf-8"),
+            file_name="top_repositories.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    st.markdown('<div id="developer-analysis"></div>', unsafe_allow_html=True)
+    st.markdown("## Developer analysis")
+    dev_view = developers.head(top_n).copy()
+    dev_view["is_bot"] = dev_view["developer"].str.contains(r"\[bot\]$", case=False, regex=True, na=False)
+    dev_view["account_type"] = dev_view["is_bot"].map({True: "Bot account", False: "Regular account"})
+    dev_view["display_name"] = dev_view.apply(
+        lambda row: f"{row['developer']} · bot" if row["is_bot"] else row["developer"], axis=1
+    )
+    left, right = st.columns([1.1, 0.9])
+    with left:
+        st.plotly_chart(ranked_figure(dev_view, "display_name", COLORS["orange"]), width="stretch", config=PLOTLY_CONFIG)
+    with right:
+        st.dataframe(
+            dev_view[["developer", "count", "account_type"]].rename(
+                columns={"developer": "Developer", "count": "Events", "account_type": "Account type"}
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption("Bot classification uses the visible `[bot]` account suffix when present.")
+        st.download_button(
+            "⬇ Download displayed developers",
+            dev_view[["developer", "count", "account_type"]].to_csv(index=False).encode("utf-8"),
+            file_name="top_developers.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    st.markdown('<div id="daily-activity"></div>', unsafe_allow_html=True)
+    st.markdown("## Daily activity")
+    daily = frames["daily_activity"][["date", "count"]].copy()
+    daily["date"] = pd.to_datetime(daily["date"], errors="coerce", utc=True)
+    daily["count"] = numeric_column(daily, "count")
+    daily = daily.dropna(subset=["date"]).sort_values("date")
+    if daily.empty:
+        st.warning("No valid dates were found in daily_activity.csv. Check its date column and regenerate the result file if needed.")
+    else:
+        line = px.line(daily, x="date", y="count", markers=True, labels={"date": "Date", "count": "Events in sample"})
+        line.update_traces(line_color=COLORS["green"], marker_color=COLORS["blue"], marker_size=9,
+                           hovertemplate="%{x|%Y-%m-%d}<br>Events: %{y:,}<extra></extra>")
+        line.update_xaxes(tickformat="%b %d, %Y")
+        st.plotly_chart(chart_layout(line, height=360), width="stretch", config=PLOTLY_CONFIG)
+
+    st.markdown("## Activity heatmap")
+    heat = frames["activity_heatmap"][["date", "hour", "count"]].copy()
+    heat["date"] = pd.to_datetime(heat["date"], errors="coerce", utc=True).dt.strftime("%Y-%m-%d")
+    heat["hour"] = pd.to_numeric(heat["hour"], errors="coerce")
+    heat["count"] = numeric_column(heat, "count")
+    heat = heat.dropna(subset=["date", "hour"])
+    heat = heat[heat["hour"].between(0, 23)]
+    if heat.empty:
+        st.warning("No valid date/hour combinations were found in activity_heatmap.csv.")
+    else:
+        heat["hour"] = heat["hour"].astype(int)
+        pivot = heat.pivot_table(index="date", columns="hour", values="count", aggfunc="sum")
+        pivot = pivot.reindex(index=sorted(pivot.index), columns=range(24), fill_value=0).fillna(0)
+        heatmap = go.Figure(
+            go.Heatmap(
+                z=pivot.values,
+                x=list(range(24)),
+                y=pivot.index.tolist(),
+                colorscale=[[0, "#161b22"], [0.35, "#1f6feb"], [0.7, "#2da44e"], [1, "#d29922"]],
+                colorbar={"title": "Events", "tickfont": {"color": COLORS["text"]}},
+                hovertemplate="Date: %{y}<br>Hour: %{x}:00 UTC<br>Events in sample: %{z:,}<extra></extra>",
+                zmin=0,
+            )
+        )
+        heatmap.update_xaxes(title="Hour of day (UTC)", tickmode="array", tickvals=list(range(24)), ticktext=[f"{hour:02d}" for hour in range(24)])
+        heatmap.update_yaxes(title="Date")
+        st.plotly_chart(chart_layout(heatmap, height=max(300, min(520, 45 * len(pivot.index) + 140))), width="stretch", config=PLOTLY_CONFIG)
+        st.caption("Empty cells are zero records in this collected sample; they do not mean there was no activity globally.")
+
+    st.markdown("## Insights")
+    groups = split_insights(insight_text)
+    a, b, c = st.columns(3)
+    for column, name, icon in [(a, "Main findings", "🔎"), (b, "Recommendations", "🧭"), (c, "Limitations", "ⓘ")]:
+        with column:
+            show_insight_group(name, groups.get(name, []), icon)
+
+    st.markdown('<div id="data-quality-and-methodology"></div>', unsafe_allow_html=True)
+    with st.expander("Data Quality and Methodology", expanded=False):
+        quality = [
+            ("Number of input records", summary.get("input_records")),
+            ("Number of unique events", summary.get("unique_events")),
+            ("Number of repositories", summary.get("unique_repositories")),
+            ("Number of developers", summary.get("unique_developers")),
+            ("Spark version", summary.get("spark_version")),
+            ("Data start time (UTC)", summary.get("start_utc")),
+            ("Data end time (UTC)", summary.get("end_utc")),
+            ("Synthetic events used", "Yes" if pd.to_numeric(pd.Series([summary.get("synthetic_events")]), errors="coerce").fillna(0).iloc[0] > 0 else ("No" if "synthetic_events" in summary else "Not provided")),
+            ("Source filter", summary.get("source_filter")),
+        ]
+        quality_cols = st.columns(3)
+        for index, (label, value) in enumerate(quality):
+            quality_cols[index % 3].metric(label, format_number(value) if isinstance(value, (int, float)) else (str(value) if value not in (None, "") else "Not provided"))
+        st.caption("All values above are read from summary.json. Activity describes only the collected input sample.")
+
+    st.markdown("## Download result files")
+    download_cols = st.columns(3)
+    downloads = [
+        ("event_types", "event_types.csv", "text/csv"),
+        ("repositories", "repositories.csv", "text/csv"),
+        ("developers", "developers.csv", "text/csv"),
+        ("daily_activity", "daily_activity.csv", "text/csv"),
+        ("activity_heatmap", "activity_heatmap.csv", "text/csv"),
+        ("summary", "summary.json", "application/json"),
+    ]
+    for index, (key, filename, mime) in enumerate(downloads):
+        if key == "summary":
+            payload = json.dumps(summary, indent=2, ensure_ascii=False).encode("utf-8")
+        else:
+            payload = frames[key].to_csv(index=False).encode("utf-8")
+        with download_cols[index % 3]:
+            st.download_button(f"⬇ {filename}", payload, file_name=filename, mime=mime, width="stretch", key=f"download_{key}")
+
+    st.markdown("## Export for Power BI")
+    st.markdown(
+        f"Download the current {source_label} result tables together in one package. "
+        "Import the CSVs into Power BI Desktop, then save your report as a `.pbix` file."
+    )
+    st.download_button(
+        "⬇ Download Power BI import package (.zip)",
+        data=build_powerbi_package(summary, frames, insight_text),
+        file_name="github_public_activity_powerbi.zip",
+        mime="application/zip",
+        width="stretch",
+        key="download_powerbi_package",
+    )
+
+    st.caption(f"Data source: {source_label}. PySpark analysis outputs are displayed as supplied; no analytics are recomputed in the dashboard.")
+
+
+if __name__ == "__main__":
+    main()

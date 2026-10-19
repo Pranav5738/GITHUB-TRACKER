@@ -1,0 +1,6 @@
+streamlit>=1.41
+pandas
+plotly
+cassandra-driver>=3.30.1,<4
+pyasyncore>=1.0.5,<2
+python-dotenv>=1.0,<2
